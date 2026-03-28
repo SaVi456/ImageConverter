@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pip --version)",
+      "Bash(python -m venv venv)",
+      "Bash(venv/Scripts/pip install:*)",
+      "Bash(venv/Scripts/python -c \":*)",
+      "Bash(start \"\" venvScriptspythonw.exe image_converter.py)",
+      "Bash(cmd /c \"start \"\"\"\" \"\"venv\\\\Scripts\\\\pythonw.exe\"\" image_converter.py\")",
+      "Bash(powershell -command \":*)",
+      "Bash(tasklist)",
+      "Bash(pip show:*)",
+      "Bash(pip list:*)",
+      "Bash(python -c \"from PIL import features; print\\(features.check_codec\\(''jpg''\\)\\); print\\(features.check_codec\\(''jpg_2000''\\)\\); print\\(features.check\\(''webp_anim''\\)\\); print\\(features.check\\(''libtiff''\\)\\); print\\(features.check\\(''raqm''\\)\\); print\\(features.check\\(''littlecms2''\\)\\)\")",
+      "Bash(python -c \"import concurrent.futures, multiprocessing; print\\(''CPU count:'', multiprocessing.cpu_count\\(\\)\\); print\\(''os.cpu_count:'', __import__\\(''os''\\).cpu_count\\(\\)\\)\")",
+      "Bash(python -c \"import PIL; print\\(''Pillow version:'', PIL.__version__\\); from PIL import Image; print\\(''Available save formats:'', sorted\\([k for k in Image.registered_extensions\\(\\).values\\(\\) if k]\\)[:30]\\)\")",
+      "Bash(python -c \"import shutil, os; stat = shutil.disk_usage\\(''C:/''\\); print\\(f''Total: {stat.total//2**30} GB, Free: {stat.free//2**30} GB''\\)\")",
+      "Bash(python -c \"import PIL; from PIL import Image; print\\(sorted\\(set\\(Image.registered_extensions\\(\\).values\\(\\)\\)\\)\\)\")",
+      "Bash(python -c \"import json, configparser, logging, concurrent.futures, queue, dataclasses; print\\(''stdlib modules OK''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(venv/Scripts/python run_tests.py)"
+    ]
+  }
+}
