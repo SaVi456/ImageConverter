@@ -237,6 +237,15 @@ The test suite creates synthetic test images, runs all conversion paths, and cle
 
 ---
 
+## Contributors
+
+| Contributor | Role |
+|-------------|------|
+| [SaVi456](https://github.com/SaVi456) | Creator & maintainer |
+| [Claude Sonnet 4.6](https://claude.ai) (Anthropic) | Co-developer |
+
+---
+
 ## License
 
 [MIT](LICENSE)
