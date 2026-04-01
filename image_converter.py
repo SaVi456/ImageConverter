@@ -6,6 +6,7 @@ Robust batch image format conversion and resizing for scientists.
 
 import json
 import logging
+import re
 import os
 import queue
 import shutil
@@ -422,7 +423,7 @@ def convert_one(
             # ── Build save kwargs ─────────────────────────────────────
             kw: dict = {}
 
-            if "dpi" in meta and fmt in ("JPEG", "PNG", "TIFF"):
+            if "dpi" in meta and fmt in ("JPEG", "PNG", "TIFF", "WebP"):
                 kw["dpi"] = meta["dpi"]
 
             if fmt == "JPEG":
@@ -1172,10 +1173,16 @@ class ImageConverterApp(tk.Tk):
             return
         output_dir = Path(output_str)
 
-        # Guard: output inside input with overwrite
+        # Guard: same or nested folders
         try:
-            if (output_dir == input_dir or input_dir in output_dir.parents) \
-               and self._overwrite_var.get():
+            if output_dir == input_dir:
+                if not messagebox.askyesno(
+                    "Warning",
+                    "Output folder is the same as the input folder.\n"
+                    "Converted files will be mixed with originals. Continue?"
+                ):
+                    return
+            elif input_dir in output_dir.parents and self._overwrite_var.get():
                 if not messagebox.askyesno(
                     "Warning",
                     "Output folder is inside the input folder and Overwrite is ON.\n"
@@ -1285,7 +1292,7 @@ class ImageConverterApp(tk.Tk):
                 png_compression=self._png_comp_var.get(),
                 msg_queue=self._msg_queue,
                 stop_event=self._stop_event,
-                filename_suffix=self._suffix_var.get().strip(),
+                filename_suffix=re.sub(r'[\\/:*?"<>|]', '', self._suffix_var.get().strip()),
                 webp_lossless=self._webp_lossless_var.get(),
                 keep_16bit=self._tiff_16bit_var.get(),
             ),
