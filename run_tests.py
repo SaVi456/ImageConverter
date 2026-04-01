@@ -1,4 +1,4 @@
-"""Full test suite for image_converter v2.0"""
+"""Full test suite for image_converter v2.1"""
 import sys, threading, pathlib, queue, shutil
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -40,6 +40,21 @@ for name, size, mode in cases:
         img = Image.new(mode, size, 128 if mode == "L" else (100, 149, 237))
     img.save(p)
     print(f"  created {name}  {size} {mode}")
+
+# ── Create a multi-frame TIFF ──────────────────────────────────────────────
+frames = [Image.new("RGB", (128, 128), (i * 40, 100, 200)) for i in range(4)]
+frames[0].save(
+    IN / "multiframe.tiff",
+    save_all=True,
+    append_images=frames[1:],
+)
+print(f"  created multiframe.tiff  4 frames RGB")
+
+# ── Create a 16-bit grayscale TIFF ────────────────────────────────────────
+arr16 = np.random.randint(0, 65535, (128, 128), dtype=np.uint16)
+img16 = Image.fromarray(arr16.astype(np.int32), mode="I")
+img16.save(IN / "16bit.tiff")
+print(f"  created 16bit.tiff  (I mode / 16-bit)")
 
 
 def drain(q):
@@ -189,11 +204,9 @@ check("empty" in msg.lower(), "error message mentions 'empty'")
 empty.unlink()
 
 # ── Test 10: Filename collision detection ─────────────────────────────────
-# Two files with the same stem but different extensions -> both map to same output
 print("\nTEST 10: Filename collision detection (same stem, different extension)")
-(IN/"coltest.jpg").write_bytes((IN/"small.jpg").read_bytes())  # coltest.jpg
-(IN/"coltest.png").write_bytes((IN/"grayscale.png").read_bytes())  # coltest.png
-# Both would map to coltest.<ext> in the output — collect_images should flag this
+(IN/"coltest.jpg").write_bytes((IN/"small.jpg").read_bytes())
+(IN/"coltest.png").write_bytes((IN/"grayscale.png").read_bytes())
 files, collisions = collect_images(IN, False, set())
 print(f"  files={len(files)}  collisions={len(collisions)}")
 check(len(collisions) >= 1, "collision detected")
@@ -203,7 +216,6 @@ check(len(collisions) >= 1, "collision detected")
 # ── Test 11: Output verification catches corrupt output ───────────────────
 print("\nTEST 11: Verify output catches corrupt file")
 dest11 = OUT/"t11"/"rgb.jpg"; dest11.parent.mkdir(parents=True, exist_ok=True)
-# Write a corrupt file first so verify=True would reject
 dest11.write_bytes(b"NOT A VALID JPEG")
 status, msg, _ = convert_one(IN/"rgb.png", dest11, "JPEG", "none", None, None, None,
                               True, 90, True, True, "tiff_lzw", 6, False)
@@ -218,6 +230,84 @@ convert_one(IN/"rgb.png", dest12, "JPEG", "none", None, None, None,
 tmp_files = list((OUT/"t12").glob(".tmp_*"))
 print(f"  temp files remaining: {tmp_files}")
 check(len(tmp_files) == 0, "no .tmp files left after conversion")
+
+# ── Test 13: Output filename suffix ──────────────────────────────────────
+print("\nTEST 13: Output filename suffix")
+q = queue.Queue(); stop = threading.Event()
+run_conversion(IN, OUT/"t13", "PNG", "none", None, None, None, True, 90,
+               True, False, 4, True, True, False, set(), "tiff_lzw", 6, q, stop,
+               filename_suffix="_converted")
+msgs = drain(q)
+done = next(m for m in msgs if m[0] == "done")
+ok, sk, err, tot = done[1], done[2], done[3], done[4]
+out_files = list((OUT/"t13").rglob("*.png"))
+suffixed = [f for f in out_files if f.stem.endswith("_converted")]
+print(f"  ok={ok}  err={err}  suffixed={len(suffixed)}/{len(out_files)}")
+check(err == 0, "zero errors")
+check(len(suffixed) == len(out_files), "all output files have suffix")
+
+# ── Test 14: WebP lossless ────────────────────────────────────────────────
+print("\nTEST 14: WebP lossless mode")
+dest14 = OUT/"t14"/"rgb.webp"; dest14.parent.mkdir(parents=True, exist_ok=True)
+status, msg, warns = convert_one(
+    IN/"rgb.png", dest14, "WebP", "none", None, None, None,
+    True, 90, True, True, "tiff_lzw", 6, False,
+    webp_lossless=True,
+)
+print(f"  status={status}")
+check(status == "ok", "WebP lossless conversion succeeded")
+with Image.open(dest14) as img:
+    check(img.size == (1920, 1080), "dimensions preserved")
+
+# ── Test 15: 16-bit TIFF preservation ────────────────────────────────────
+print("\nTEST 15: 16-bit TIFF preservation (keep_16bit=True)")
+dest15 = OUT/"t15"/"16bit.tiff"; dest15.parent.mkdir(parents=True, exist_ok=True)
+status, msg, warns = convert_one(
+    IN/"16bit.tiff", dest15, "TIFF", "none", None, None, None,
+    True, 90, True, True, "tiff_lzw", 6, False,
+    keep_16bit=True,
+)
+print(f"  status={status}  warns={warns}")
+check(status == "ok", "16-bit TIFF conversion succeeded")
+check(len(warns) == 0, "no precision-loss warning when keep_16bit=True")
+
+# ── Test 16: 16-bit TIFF without flag emits warning ──────────────────────
+print("\nTEST 16: 16-bit TIFF without keep_16bit emits precision warning")
+dest16 = OUT/"t16"/"16bit.jpg"; dest16.parent.mkdir(parents=True, exist_ok=True)
+status, msg, warns = convert_one(
+    IN/"16bit.tiff", dest16, "JPEG", "none", None, None, None,
+    True, 90, True, True, "tiff_lzw", 6, False,
+    keep_16bit=False,
+)
+print(f"  status={status}  warns={warns}")
+check(status == "ok", "conversion succeeded")
+check(any("bit" in w.lower() or "precision" in w.lower() for w in warns),
+      "precision warning emitted for 16-bit -> JPEG")
+
+# ── Test 17: Multi-frame TIFF preserved ──────────────────────────────────
+print("\nTEST 17: Multi-frame TIFF -> TIFF preserves all frames")
+dest17 = OUT/"t17"/"multiframe.tiff"; dest17.parent.mkdir(parents=True, exist_ok=True)
+status, msg, warns = convert_one(
+    IN/"multiframe.tiff", dest17, "TIFF", "none", None, None, None,
+    True, 90, True, True, "tiff_lzw", 6, False,
+)
+print(f"  status={status}  msg={msg}")
+check(status == "ok", "multi-frame TIFF conversion succeeded")
+with Image.open(dest17) as img:
+    n = getattr(img, "n_frames", 1)
+    print(f"  output frames: {n}")
+    check(n == 4, f"all 4 frames preserved (got {n})")
+
+# ── Test 18: Multi-frame TIFF -> JPEG warns, converts frame 1 ────────────
+print("\nTEST 18: Multi-frame TIFF -> JPEG warns and converts frame 1 only")
+dest18 = OUT/"t18"/"multiframe.jpg"; dest18.parent.mkdir(parents=True, exist_ok=True)
+status, msg, warns = convert_one(
+    IN/"multiframe.tiff", dest18, "JPEG", "none", None, None, None,
+    True, 90, True, True, "tiff_lzw", 6, False,
+)
+print(f"  status={status}  warns={warns}")
+check(status == "ok", "conversion succeeded")
+check(any("frame" in w.lower() for w in warns), "frame warning emitted")
 
 # ── Cleanup ───────────────────────────────────────────────────────────────
 shutil.rmtree(IN)

@@ -1,5 +1,5 @@
 """
-Image Converter  v2.0.0
+Image Converter  v2.1.0
 Robust batch image format conversion and resizing for scientists.
 100% offline — parallel processing — metadata-preserving.
 """
@@ -9,6 +9,7 @@ import logging
 import os
 import queue
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -21,7 +22,7 @@ from typing import Optional
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageSequence, UnidentifiedImageError
 
 # ── Windows: enable DPI awareness for crisp rendering on HiDPI monitors ──
 if sys.platform == "win32":
@@ -35,7 +36,7 @@ if sys.platform == "win32":
 Image.MAX_IMAGE_PIXELS = None
 
 # ─────────────────────────────────────────────────────────────────────────
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 CONFIG_DIR = Path.home() / ".imageconverter"
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 LOG_DIR = CONFIG_DIR / "logs"
@@ -99,6 +100,9 @@ DEFAULTS: dict = {
     "filter_ext": "",
     "log_to_file": False,
     "window_geometry": "",
+    "filename_suffix": "",
+    "webp_lossless": False,
+    "tiff_16bit": False,
 }
 
 
@@ -157,7 +161,7 @@ def setup_file_logging() -> None:
 # ─────────────────────────────────────────────────────────────────────────
 
 def normalize_mode(
-    img: Image.Image, fmt: str
+    img: Image.Image, fmt: str, keep_16bit: bool = False
 ) -> tuple[Image.Image, list[str]]:
     """
     Convert the image mode to one compatible with *fmt*.
@@ -165,6 +169,10 @@ def normalize_mode(
     """
     warnings: list[str] = []
     mode = img.mode
+
+    # ── 16-bit TIFF passthrough ───────────────────────────────────────
+    if keep_16bit and fmt == "TIFF" and mode in ("I", "I;16", "I;16B"):
+        return img, []
 
     # ── High-bit-depth scientific images ─────────────────────────────
     if mode in ("I", "I;16", "I;16B", "I;32", "F"):
@@ -301,6 +309,30 @@ def check_disk_space(
 # Single-file conversion (runs in worker threads)
 # ─────────────────────────────────────────────────────────────────────────
 
+def _apply_resize(
+    img: Image.Image,
+    resize_mode: str,
+    width: Optional[int],
+    height: Optional[int],
+    scale: Optional[float],
+    keep_aspect: bool,
+) -> Image.Image:
+    """Apply resize to a single frame."""
+    if resize_mode == "custom":
+        tw = width or img.width
+        th = height or img.height
+        if keep_aspect:
+            img = img.copy()
+            img.thumbnail((tw, th), Image.LANCZOS)
+        else:
+            img = img.resize((tw, th), Image.LANCZOS)
+    elif resize_mode == "scale" and scale and scale != 1.0:
+        nw = max(1, int(img.width * scale))
+        nh = max(1, int(img.height * scale))
+        img = img.resize((nw, nh), Image.LANCZOS)
+    return img
+
+
 def convert_one(
     src: Path,
     dest: Path,
@@ -316,6 +348,8 @@ def convert_one(
     tiff_compression: str,
     png_compression: int,
     dry_run: bool,
+    webp_lossless: bool = False,
+    keep_16bit: bool = False,
 ) -> tuple[str, str, list[str]]:
     """
     Convert *src* → *dest*.
@@ -335,6 +369,21 @@ def convert_one(
             img.load()  # force full decode — surfaces corruption immediately
             orig_dims = f"{img.width}x{img.height}"
 
+            # ── Multi-frame detection ─────────────────────────────────
+            n_frames = getattr(img, "n_frames", 1)
+            extra_raw_frames: list[Image.Image] = []
+            if n_frames > 1:
+                if fmt == "TIFF":
+                    all_frames = list(ImageSequence.Iterator(img))
+                    # Use a single-frame copy of frame 0 so Pillow doesn't
+                    # re-iterate the source frames when saving with save_all=True.
+                    img = all_frames[0].copy()
+                    extra_raw_frames = [f.copy() for f in all_frames[1:]]
+                else:
+                    extra_warns.append(
+                        f"Multi-frame source ({n_frames} frames) — converting frame 1 only."
+                    )
+
             # ── Collect metadata ──────────────────────────────────────
             meta: dict = {}
             if preserve_metadata:
@@ -347,23 +396,11 @@ def convert_one(
                         pass
 
             # ── Mode normalisation ────────────────────────────────────
-            img, mode_warns = normalize_mode(img, fmt)
+            img, mode_warns = normalize_mode(img, fmt, keep_16bit)
             extra_warns.extend(mode_warns)
 
             # ── Resize ───────────────────────────────────────────────
-            if resize_mode == "custom":
-                tw = width or img.width
-                th = height or img.height
-                if keep_aspect:
-                    img = img.copy()
-                    img.thumbnail((tw, th), Image.LANCZOS)
-                else:
-                    img = img.resize((tw, th), Image.LANCZOS)
-
-            elif resize_mode == "scale" and scale and scale != 1.0:
-                nw = max(1, int(img.width * scale))
-                nh = max(1, int(img.height * scale))
-                img = img.resize((nw, nh), Image.LANCZOS)
+            img = _apply_resize(img, resize_mode, width, height, scale, keep_aspect)
 
             # Update EXIF pixel-dimension tags after resize
             if preserve_metadata and "exif" in meta and orig_dims != f"{img.width}x{img.height}":
@@ -374,6 +411,13 @@ def convert_one(
                     meta["exif"] = exif_obj.tobytes()
                 except Exception:
                     pass
+
+            # ── Process extra frames for multi-frame TIFF output ──────
+            processed_extras: list[Image.Image] = []
+            for ef in extra_raw_frames:
+                ef, _ = normalize_mode(ef, fmt, keep_16bit)
+                ef = _apply_resize(ef, resize_mode, width, height, scale, keep_aspect)
+                processed_extras.append(ef)
 
             # ── Build save kwargs ─────────────────────────────────────
             kw: dict = {}
@@ -403,7 +447,10 @@ def convert_one(
                     kw["icc_profile"] = meta["icc_profile"]
 
             elif fmt == "WebP":
-                kw.update(quality=jpeg_quality, method=6)
+                if webp_lossless:
+                    kw.update(lossless=True, method=6)
+                else:
+                    kw.update(quality=jpeg_quality, method=6)
                 if "exif" in meta:
                     kw["exif"] = meta["exif"]
                 if "icc_profile" in meta:
@@ -419,6 +466,9 @@ def convert_one(
                         pass
                 if "icc_profile" in meta:
                     kw["icc_profile"] = meta["icc_profile"]
+                if processed_extras:
+                    kw["save_all"] = True
+                    kw["append_images"] = processed_extras
 
             elif fmt == "JPEG2000":
                 # Lossless by default; irreversible=True for lossy
@@ -455,8 +505,12 @@ def convert_one(
 
             new_dims = f"{img.width}x{img.height}"
             resize_note = f" [{orig_dims}->{new_dims}]" if orig_dims != new_dims else ""
+            frame_note = f" ({n_frames} frames)" if n_frames > 1 and fmt == "TIFF" else ""
             size_kb = dest.stat().st_size / 1024
-            msg = f"[OK]   {src.name}  ->  {dest.name}{resize_note}  ({size_kb:.0f} KB)"
+            msg = (
+                f"[OK]   {src.name}  ->  {dest.name}"
+                f"{resize_note}{frame_note}  ({size_kb:.0f} KB)"
+            )
             return "ok", msg, extra_warns
 
     except UnidentifiedImageError:
@@ -532,6 +586,9 @@ def run_conversion(
     png_compression: int,
     msg_queue: queue.Queue,
     stop_event: threading.Event,
+    filename_suffix: str = "",
+    webp_lossless: bool = False,
+    keep_16bit: bool = False,
 ) -> None:
 
     def put(kind: str, *args) -> None:
@@ -562,7 +619,7 @@ def run_conversion(
     pre_skip = 0
     for src in files:
         rel = src.relative_to(input_dir)
-        dest = output_dir / rel.with_suffix(ext)
+        dest = output_dir / rel.with_name(rel.stem + filename_suffix + ext)
         if dest.exists() and not overwrite and not dry_run:
             put("log", "skip", f"[SKIP] {rel}")
             pre_skip += 1
@@ -591,6 +648,7 @@ def run_conversion(
                     src, dest, fmt, resize_mode, width, height, scale,
                     keep_aspect, jpeg_quality, preserve_metadata,
                     verify_output, tiff_compression, png_compression, dry_run,
+                    webp_lossless, keep_16bit,
                 ): src
                 for src, dest in batch
             }
@@ -670,6 +728,8 @@ class ImageConverterApp(tk.Tk):
         self._msg_queue: queue.Queue = queue.Queue()
         self._log_lines: list[str] = []
         self._log_filter_vars: dict[str, tk.BooleanVar] = {}
+        self._rescan_after_id: Optional[str] = None
+        self._last_output_dir: str = ""
 
         self.title(f"Image Converter  v{VERSION}")
         self.resizable(True, True)
@@ -742,8 +802,9 @@ class ImageConverterApp(tk.Tk):
                      ).pack(side=tk.LEFT, padx=4)
         tk.Label(r1, text="  JPEG/WebP quality:").pack(side=tk.LEFT)
         self._quality_var = tk.IntVar(value=90)
-        tk.Spinbox(r1, from_=1, to=100, textvariable=self._quality_var,
-                   width=5).pack(side=tk.LEFT, padx=4)
+        self._quality_spinbox = tk.Spinbox(r1, from_=1, to=100,
+                                           textvariable=self._quality_var, width=5)
+        self._quality_spinbox.pack(side=tk.LEFT, padx=4)
         tk.Label(r1, text="  Workers:").pack(side=tk.LEFT)
         self._workers_var = tk.IntVar(value=DEFAULTS["num_workers"])
         tk.Spinbox(r1, from_=1, to=64, textvariable=self._workers_var,
@@ -752,42 +813,63 @@ class ImageConverterApp(tk.Tk):
         r2 = tk.Frame(cf); r2.pack(fill=tk.X, padx=8, pady=2)
         tk.Label(r2, text="TIFF compression:", width=16, anchor="w").pack(side=tk.LEFT)
         self._tiff_comp_var = tk.StringVar(value="tiff_lzw")
-        ttk.Combobox(r2, textvariable=self._tiff_comp_var,
-                     values=TIFF_COMPRESSIONS, state="readonly", width=14
-                     ).pack(side=tk.LEFT, padx=4)
+        self._tiff_comp_combo = ttk.Combobox(r2, textvariable=self._tiff_comp_var,
+                                             values=TIFF_COMPRESSIONS, state="readonly", width=14)
+        self._tiff_comp_combo.pack(side=tk.LEFT, padx=4)
         tk.Label(r2, text="  PNG compression (0-9):").pack(side=tk.LEFT)
         self._png_comp_var = tk.IntVar(value=6)
-        tk.Spinbox(r2, from_=0, to=9, textvariable=self._png_comp_var,
-                   width=4).pack(side=tk.LEFT, padx=4)
+        self._png_comp_spinbox = tk.Spinbox(r2, from_=0, to=9,
+                                            textvariable=self._png_comp_var, width=4)
+        self._png_comp_spinbox.pack(side=tk.LEFT, padx=4)
 
         r3 = tk.Frame(cf); r3.pack(fill=tk.X, padx=8, pady=2)
         tk.Label(r3, text="Filter extensions:", width=16, anchor="w").pack(side=tk.LEFT)
         self._filter_ext_var = tk.StringVar()
-        tk.Entry(r3, textvariable=self._filter_ext_var, width=24).pack(side=tk.LEFT, padx=4)
-        tk.Label(r3, text="(e.g. .tif,.png  —  blank = all)", fg="gray",
+        tk.Entry(r3, textvariable=self._filter_ext_var, width=20).pack(side=tk.LEFT, padx=4)
+        tk.Label(r3, text="(e.g. .tif,.png)", fg="gray",
+                 font=_FONT_UI).pack(side=tk.LEFT)
+        tk.Label(r3, text="  Output suffix:", anchor="w").pack(side=tk.LEFT, padx=(12, 0))
+        self._suffix_var = tk.StringVar()
+        tk.Entry(r3, textvariable=self._suffix_var, width=14).pack(side=tk.LEFT, padx=4)
+        tk.Label(r3, text="(e.g. _converted)", fg="gray",
                  font=_FONT_UI).pack(side=tk.LEFT)
 
         r4 = tk.Frame(cf); r4.pack(fill=tk.X, padx=8, pady=2)
         self._overwrite_var     = tk.BooleanVar()
         self._recursive_var     = tk.BooleanVar()
         self._preserve_meta_var = tk.BooleanVar(value=True)
+        self._webp_lossless_var = tk.BooleanVar()
         tk.Checkbutton(r4, text="Overwrite existing",
                        variable=self._overwrite_var).pack(side=tk.LEFT)
         tk.Checkbutton(r4, text="Sub-folders",
                        variable=self._recursive_var).pack(side=tk.LEFT, padx=10)
         tk.Checkbutton(r4, text="Preserve metadata  (EXIF / ICC / DPI)",
                        variable=self._preserve_meta_var).pack(side=tk.LEFT, padx=10)
+        self._webp_lossless_cb = tk.Checkbutton(r4, text="WebP lossless",
+                                                variable=self._webp_lossless_var)
+        self._webp_lossless_cb.pack(side=tk.LEFT, padx=10)
 
         r5 = tk.Frame(cf); r5.pack(fill=tk.X, padx=8, pady=2)
         self._verify_var      = tk.BooleanVar(value=True)
         self._dry_run_var     = tk.BooleanVar()
         self._log_to_file_var = tk.BooleanVar()
+        self._tiff_16bit_var  = tk.BooleanVar()
         tk.Checkbutton(r5, text="Verify output files",
                        variable=self._verify_var).pack(side=tk.LEFT)
         tk.Checkbutton(r5, text="Dry run  (preview only)",
                        variable=self._dry_run_var).pack(side=tk.LEFT, padx=10)
         tk.Checkbutton(r5, text="Auto-save log",
                        variable=self._log_to_file_var).pack(side=tk.LEFT, padx=10)
+        self._tiff_16bit_cb = tk.Checkbutton(r5, text="TIFF: preserve 16-bit",
+                                             variable=self._tiff_16bit_var)
+        self._tiff_16bit_cb.pack(side=tk.LEFT, padx=10)
+
+        # Format-change trace — enables/disables format-specific controls
+        self._fmt_var.trace_add("write", lambda *_: self._on_fmt_change())
+
+        # File-count re-scan when recursive or filter changes
+        self._recursive_var.trace_add("write", lambda *_: self._trigger_rescan())
+        self._filter_ext_var.trace_add("write", lambda *_: self._trigger_rescan())
 
         # ── Resize ────────────────────────────────────────────────────
         rf = tk.LabelFrame(self, text=" Resize Options ", font=_FONT_BOLD, **pad)
@@ -808,8 +890,9 @@ class ImageConverterApp(tk.Tk):
         self._scale_frame.pack(anchor="w", padx=8, pady=2)
         tk.Label(self._scale_frame, text="Scale %:").pack(side=tk.LEFT)
         self._scale_var = tk.DoubleVar(value=50.0)
-        tk.Spinbox(self._scale_frame, from_=1, to=10000, increment=5,
-                   textvariable=self._scale_var, width=7).pack(side=tk.LEFT, padx=4)
+        self._scale_spinbox = tk.Spinbox(self._scale_frame, from_=1, to=10000, increment=5,
+                                         textvariable=self._scale_var, width=7)
+        self._scale_spinbox.pack(side=tk.LEFT, padx=4)
 
         self._dim_frame = tk.Frame(right_rf)
         self._dim_frame.pack(anchor="w", padx=8, pady=2)
@@ -886,6 +969,12 @@ class ImageConverterApp(tk.Tk):
         tk.Button(bf, text="Clear Log",  command=self._clear_log,  width=10).pack(side=tk.LEFT, padx=4)
         tk.Button(bf, text="Export Log", command=self._export_log, width=10).pack(side=tk.LEFT, padx=4)
 
+        self._open_output_btn = tk.Button(
+            bf, text="Open Output", command=self._open_output_folder,
+            width=12, state=tk.DISABLED,
+        )
+        self._open_output_btn.pack(side=tk.LEFT, padx=4)
+
         self._stop_btn = tk.Button(
             bf, text="Stop  [Esc]", command=self._stop,
             width=12, state=tk.DISABLED, bg="#c0392b", fg="white",
@@ -918,6 +1007,21 @@ class ImageConverterApp(tk.Tk):
         self.bind("<Escape>",         lambda _: self._stop())
         self.bind("<Control-l>",      lambda _: self._clear_log())
 
+    # ── Format-aware control enabling ────────────────────────────────────
+
+    def _on_fmt_change(self) -> None:
+        fmt = self._fmt_var.get()
+        quality_state = tk.NORMAL if fmt in ("JPEG", "WebP", "JPEG2000") else tk.DISABLED
+        self._quality_spinbox.configure(state=quality_state)
+        self._png_comp_spinbox.configure(
+            state=tk.NORMAL if fmt == "PNG" else tk.DISABLED)
+        self._tiff_comp_combo.configure(
+            state="readonly" if fmt == "TIFF" else tk.DISABLED)
+        self._webp_lossless_cb.configure(
+            state=tk.NORMAL if fmt == "WebP" else tk.DISABLED)
+        self._tiff_16bit_cb.configure(
+            state=tk.NORMAL if fmt == "TIFF" else tk.DISABLED)
+
     # ── Events ────────────────────────────────────────────────────────────
 
     def _browse_input(self) -> None:
@@ -928,7 +1032,9 @@ class ImageConverterApp(tk.Tk):
                 self._output_var.set(str(Path(d).parent / "converted"))
             self._file_count_var.set("Scanning…")
             threading.Thread(
-                target=self._scan_file_count, args=(Path(d),), daemon=True
+                target=self._scan_file_count,
+                args=(Path(d), self._filter_ext_var.get(), self._recursive_var.get()),
+                daemon=True,
             ).start()
 
     def _browse_output(self) -> None:
@@ -936,11 +1042,30 @@ class ImageConverterApp(tk.Tk):
         if d:
             self._output_var.set(d)
 
-    def _scan_file_count(self, d: Path) -> None:
+    def _trigger_rescan(self) -> None:
+        """Debounced re-scan of input file count when filter or recursive changes."""
+        d = self._input_var.get().strip()
+        if not d:
+            return
+        if self._rescan_after_id:
+            self.after_cancel(self._rescan_after_id)
+        fe_raw = self._filter_ext_var.get()
+        recursive = self._recursive_var.get()
+        self._file_count_var.set("Scanning…")
+        self._rescan_after_id = self.after(
+            250,
+            lambda: threading.Thread(
+                target=self._scan_file_count,
+                args=(Path(d), fe_raw, recursive),
+                daemon=True,
+            ).start()
+        )
+
+    def _scan_file_count(self, d: Path, fe_raw: str = "", recursive: bool = False) -> None:
         try:
-            fe = self._parse_filter_ext(self._filter_ext_var.get())
+            fe = self._parse_filter_ext(fe_raw)
             exts = fe if fe else INPUT_EXTENSIONS
-            pattern = "**/*" if self._recursive_var.get() else "*"
+            pattern = "**/*" if recursive else "*"
             n = sum(1 for p in d.glob(pattern)
                     if p.is_file() and p.suffix.lower() in exts)
             self.after(0, lambda: self._file_count_var.set(f"{n:,} image(s)"))
@@ -950,7 +1075,8 @@ class ImageConverterApp(tk.Tk):
     def _on_resize_mode(self) -> None:
         mode = self._resize_mode.get()
         for w in self._scale_frame.winfo_children():
-            w.configure(state=tk.NORMAL if mode == "scale" else tk.DISABLED)
+            if isinstance(w, (tk.Spinbox, tk.Entry)):
+                w.configure(state=tk.NORMAL if mode == "scale" else tk.DISABLED)
         for w in self._dim_frame.winfo_children():
             if isinstance(w, (tk.Entry, tk.Checkbutton)):
                 w.configure(state=tk.NORMAL if mode == "custom" else tk.DISABLED)
@@ -966,6 +1092,7 @@ class ImageConverterApp(tk.Tk):
         self._progress_var.set(0)
         self._status_var.set("Ready.")
         self._eta_var.set("")
+        self._open_output_btn.configure(state=tk.DISABLED)
 
     def _export_log(self) -> None:
         if not self._log_lines:
@@ -984,6 +1111,16 @@ class ImageConverterApp(tk.Tk):
             except Exception as e:
                 messagebox.showerror("Error", str(e))
 
+    def _open_output_folder(self) -> None:
+        path = self._last_output_dir or self._output_var.get().strip()
+        if path and Path(path).exists():
+            if sys.platform == "win32":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+
     def _stop(self) -> None:
         if self._worker and self._worker.is_alive():
             self._stop_event.set()
@@ -996,6 +1133,12 @@ class ImageConverterApp(tk.Tk):
                 return
             self._stop_event.set()
             self._worker.join(timeout=3)
+            if self._worker.is_alive():
+                if not messagebox.askyesno(
+                    "Still running",
+                    "Conversion is still finishing. Force quit?"
+                ):
+                    return
         self._save_current_settings()
         self.destroy()
 
@@ -1109,11 +1252,13 @@ class ImageConverterApp(tk.Tk):
         except Exception:
             pass
 
+        self._last_output_dir = str(output_dir)
         self._save_current_settings()
         self._stop_event.clear()
         self._msg_queue = queue.Queue()
         self._convert_btn.configure(state=tk.DISABLED)
         self._stop_btn.configure(state=tk.NORMAL)
+        self._open_output_btn.configure(state=tk.DISABLED)
         self._clear_log()
         self._status_var.set("Starting…")
 
@@ -1140,6 +1285,9 @@ class ImageConverterApp(tk.Tk):
                 png_compression=self._png_comp_var.get(),
                 msg_queue=self._msg_queue,
                 stop_event=self._stop_event,
+                filename_suffix=self._suffix_var.get().strip(),
+                webp_lossless=self._webp_lossless_var.get(),
+                keep_16bit=self._tiff_16bit_var.get(),
             ),
             daemon=True,
         )
@@ -1188,6 +1336,8 @@ class ImageConverterApp(tk.Tk):
                         self._append_log("warn",
                             f"[WARN] {errors} file(s) had errors — "
                             "use Export Log to save a full report.")
+                    if ok > 0:
+                        self._open_output_btn.configure(state=tk.NORMAL)
                     if self._log_to_file_var.get():
                         self._auto_save_log()
 
@@ -1208,8 +1358,8 @@ class ImageConverterApp(tk.Tk):
             self._log_widget.configure(state=tk.DISABLED)
 
         self._log_widget.configure(state=tk.NORMAL)
-        # Apply current filter state
-        elide = not self._log_filter_vars.get(tag, tk.BooleanVar(value=True)).get()
+        fv = self._log_filter_vars.get(tag)
+        elide = not fv.get() if fv is not None else False
         self._log_widget.tag_configure(tag, elide=elide)
         self._log_widget.insert(tk.END, message + "\n", tag)
         self._log_widget.see(tk.END)
@@ -1265,9 +1415,9 @@ class ImageConverterApp(tk.Tk):
             if sys.platform == "win32":
                 os.startfile(LOG_DIR)
             elif sys.platform == "darwin":
-                os.system(f"open '{LOG_DIR}'")
+                subprocess.Popen(["open", str(LOG_DIR)])
             else:
-                os.system(f"xdg-open '{LOG_DIR}'")
+                subprocess.Popen(["xdg-open", str(LOG_DIR)])
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
@@ -1312,11 +1462,11 @@ class ImageConverterApp(tk.Tk):
             except Exception:
                 pass
         self.update_idletasks()
-        w  = 800
+        w  = 820
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
         tb = 60
-        h  = min(740, sh - tb)
+        h  = min(760, sh - tb)
         x  = (sw - w) // 2
         y  = max(0, (sh - h - tb) // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
@@ -1343,6 +1493,9 @@ class ImageConverterApp(tk.Tk):
         s["filter_ext"]       = self._filter_ext_var.get()
         s["log_to_file"]      = self._log_to_file_var.get()
         s["window_geometry"]  = self.geometry()
+        s["filename_suffix"]  = self._suffix_var.get()
+        s["webp_lossless"]    = self._webp_lossless_var.get()
+        s["tiff_16bit"]       = self._tiff_16bit_var.get()
         save_settings(s)
 
     def _load_settings_to_ui(self) -> None:
@@ -1366,7 +1519,11 @@ class ImageConverterApp(tk.Tk):
         self._png_comp_var.set(s.get("png_compression", 6))
         self._filter_ext_var.set(s.get("filter_ext", ""))
         self._log_to_file_var.set(s.get("log_to_file", False))
+        self._suffix_var.set(s.get("filename_suffix", ""))
+        self._webp_lossless_var.set(s.get("webp_lossless", False))
+        self._tiff_16bit_var.set(s.get("tiff_16bit", False))
         self._on_resize_mode()
+        self._on_fmt_change()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1374,6 +1531,7 @@ class ImageConverterApp(tk.Tk):
 # ─────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    setup_file_logging()
+    if load_settings().get("log_to_file"):
+        setup_file_logging()
     app = ImageConverterApp()
     app.mainloop()
