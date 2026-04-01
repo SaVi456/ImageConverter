@@ -925,6 +925,30 @@ class ImageConverterApp(tk.Tk):
         tk.Label(pr, textvariable=self._eta_var,
                  anchor="e", fg="#555").pack(side=tk.RIGHT)
 
+        # ── Buttons (packed before log so they always stay visible) ──────
+        bf = tk.Frame(self); bf.pack(fill=tk.X, padx=10, pady=6)
+
+        tk.Button(bf, text="Clear Log",  command=self._clear_log,  width=10).pack(side=tk.LEFT, padx=4)
+        tk.Button(bf, text="Export Log", command=self._export_log, width=10).pack(side=tk.LEFT, padx=4)
+
+        self._open_output_btn = tk.Button(
+            bf, text="Open Output", command=self._open_output_folder,
+            width=12, state=tk.DISABLED,
+        )
+        self._open_output_btn.pack(side=tk.LEFT, padx=4)
+
+        self._stop_btn = tk.Button(
+            bf, text="Stop  [Esc]", command=self._stop,
+            width=12, state=tk.DISABLED, bg="#c0392b", fg="white",
+        )
+        self._stop_btn.pack(side=tk.RIGHT, padx=4)
+
+        self._convert_btn = tk.Button(
+            bf, text="Convert  [Ctrl+Enter]", command=self._start_conversion,
+            width=22, bg="#1e3a5f", fg="white", font=_FONT_BOLD,
+        )
+        self._convert_btn.pack(side=tk.RIGHT, padx=4)
+
         # ── Log ───────────────────────────────────────────────────────
         lf = tk.LabelFrame(self, text=" Log ", font=_FONT_BOLD, **pad)
         lf.pack(fill=tk.BOTH, expand=True, **pad)
@@ -962,30 +986,6 @@ class ImageConverterApp(tk.Tk):
         sb_y.pack(side=tk.RIGHT,  fill=tk.Y)
         sb_x.pack(side=tk.BOTTOM, fill=tk.X)
         self._log_widget.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-
-        # ── Buttons ───────────────────────────────────────────────────
-        bf = tk.Frame(self); bf.pack(fill=tk.X, padx=10, pady=6)
-
-        tk.Button(bf, text="Clear Log",  command=self._clear_log,  width=10).pack(side=tk.LEFT, padx=4)
-        tk.Button(bf, text="Export Log", command=self._export_log, width=10).pack(side=tk.LEFT, padx=4)
-
-        self._open_output_btn = tk.Button(
-            bf, text="Open Output", command=self._open_output_folder,
-            width=12, state=tk.DISABLED,
-        )
-        self._open_output_btn.pack(side=tk.LEFT, padx=4)
-
-        self._stop_btn = tk.Button(
-            bf, text="Stop  [Esc]", command=self._stop,
-            width=12, state=tk.DISABLED, bg="#c0392b", fg="white",
-        )
-        self._stop_btn.pack(side=tk.RIGHT, padx=4)
-
-        self._convert_btn = tk.Button(
-            bf, text="Convert  [Ctrl+Enter]", command=self._start_conversion,
-            width=22, bg="#1e3a5f", fg="white", font=_FONT_BOLD,
-        )
-        self._convert_btn.pack(side=tk.RIGHT, padx=4)
 
     def _make_folder_row(
         self, parent, label: str, var: tk.StringVar,
