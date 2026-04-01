@@ -942,13 +942,13 @@ class ImageConverterApp(tk.Tk):
             bf, text="Stop  [Esc]", command=self._stop,
             width=12, state=tk.DISABLED, bg="#c0392b", fg="white",
         )
-        self._stop_btn.pack(side=tk.RIGHT, padx=4)
-
         self._convert_btn = tk.Button(
             bf, text="Convert  [Ctrl+Enter]", command=self._start_conversion,
             width=22, bg="#1e3a5f", fg="white", font=_FONT_BOLD,
         )
         self._convert_btn.pack(side=tk.RIGHT, padx=4)
+
+        self._stop_btn.pack(side=tk.RIGHT, padx=4)
 
         # ── Log ───────────────────────────────────────────────────────
         lf = tk.LabelFrame(self, text=" Log ", font=_FONT_BOLD, **pad)
